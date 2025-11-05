@@ -34,7 +34,6 @@ def gather_neighbors(x, idx):
 
     idx_flat = idx.view(B, N * idx.shape[-1])
     batch_indices = torch.arange(B, device = x.device, dtype=torch.long).unsqueeze(1).repeat(1, N * idx.shape[-1])
-    # This avoids creating the large [B, N, N, C] intermediate tensor
     gathered_flat = x[batch_indices, idx_flat]
 
     # Reshape the gathered tensor to the final output shape
@@ -64,17 +63,15 @@ class CloudLSTMCell(nn.Module):
             h_t_minus_1 = torch.zeros(B, N, self.hidden_dim, device=feat_t.device)
             c_t_minus_1 = torch.zeros(B, N, self.hidden_dim, device=feat_t.device)
 
-        # KNN and neighbor gathering
-        h_neighbors = gather_neighbors(h_t_minus_1, indices)
-
-        # Message passing
-        h_t_minus_1_expanded = h_t_minus_1.unsqueeze(2).repeat(1, 1, self.k, 1)
-
-        #print(h_t_minus_1_expanded.shape, flush=True)
-        #print(h_neighbors.shape, flush=True)
-
-        msg_input = torch.cat([h_t_minus_1_expanded, h_neighbors], dim=-1)
-        msg = self.msg_mlp(msg_input).sum(dim=2)
+        if self.k == 0:
+            msg = torch.zeros(B, N, self.msg_dim, device=feat_t.device)
+        else:
+            # KNN and neighbor gathering
+            h_neighbors = gather_neighbors(h_t_minus_1, indices)
+            # Message passing
+            h_t_minus_1_expanded = h_t_minus_1.unsqueeze(2).repeat(1, 1, self.k, 1)
+            msg_input = torch.cat([h_t_minus_1_expanded, h_neighbors], dim=-1)
+            msg = self.msg_mlp(msg_input).sum(dim=2)
 
         # LSTM cell update
         lstm_input = torch.cat([msg, self.feat_linear(feat_t)], dim=-1)
@@ -82,7 +79,6 @@ class CloudLSTMCell(nn.Module):
 
         return h_t.view(B, N, -1), c_t.view(B, N, -1)
 
-# --- Full predictor with Gaussian NLL Head ---
 class CloudLSTMNextScan(nn.Module):
     """
     Input:   sequence of T frames, each [N,8] (xyz + CNR + wind(3) + conf)
@@ -97,22 +93,16 @@ class CloudLSTMNextScan(nn.Module):
         self.cell = CloudLSTMCell(in_dim=in_dim, hidden_dim=hidden_dim, msg_dim=msg_dim, k=k)
 
         # Number of features to predict (non-xyz)
-        self.pred_dim = 1  # (8-3=5)
+        self.pred_dim = 1
 
-        # The head now has two separate branches for mean and log-std
+        # The Prediction head 
         self.mean_head = nn.Sequential(
             nn.Linear(hidden_dim, 128), nn.ReLU(),
             nn.Linear(128, 64), nn.ReLU(),
             nn.Linear(64, self.pred_dim), # Outputs the predicted mean (delta features)
         )
 
-        self.log_std_head = nn.Sequential(
-            nn.Linear(hidden_dim, 128), nn.ReLU(),
-            nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, self.pred_dim),
-        )
-
-    def forward(self, x, precomputed_indices):  # x: [B,T,N,8]
+    def forward(self, x, precomputed_indices):  # x: [B,T,N,F]
         B, T, N, F = x.shape
         assert T >= 2, "Need at least two frames (t-1, t)."
 
@@ -125,27 +115,27 @@ class CloudLSTMNextScan(nn.Module):
         h = c = None
         # Unroll over time (uses per-frame xyz for neighborhoods)
         for t in range(T):
-            feat_t = x[:, t, :, :]      # [B,N,8] (all features)
+            feat_t = x[:, t, :, :]
             h, c = self.cell(feat_t, precomputed_indices, h, c)
 
-        # Predict the delta features as the mean of the distribution
+        # Predict the delta CNR
         pred_delta_features = self.mean_head(h)  # [B,N,1]
 
         # Get the last full feature vector (xyz + additional features)
-        last_features = x[:, -1, :, :7]      # [B,N,8] (features at time t)
+        last_features = x[:, -1, :, :7]
 
-        # Get the constant xyz coordinates from the last frame
+        # Get the constant coordinates from the last frame
         last_xyz = last_features[:, :, :3] # [B,N,3]
 
         # Get the additional features from the last frame
-        last_additional_features = last_features[:, :, 3:4] # [B,N,1]
-        last_wind_features = last_features[:, :, 4:7] #[B,N,4]
+        last_additional_features = last_features[:, :, 3:4]
+        last_wind_features = last_features[:, :, 4:7]
 
-        # Predict the next additional feature vector by adding the mean delta
-        pred_next_additional_feat = last_additional_features + pred_delta_features # [B,N,5]
+        # Predict the next additional feature vector by adding the delta
+        pred_next_additional_feat = last_additional_features + pred_delta_features
 
-        # Concatenate the constant xyz with the new predicted additional features
-        pred_next_feat = torch.cat([last_xyz, pred_next_additional_feat, last_wind_features], dim=-1) # [B,N,8]
+        # Concatenate the constant's with the new predicted CNR
+        pred_next_feat = torch.cat([last_xyz, pred_next_additional_feat, last_wind_features], dim=-1)
 
         return pred_next_feat, pred_delta_features
 
@@ -155,8 +145,6 @@ def min_max_scale(tensor, min_val, max_val):
 
     # Avoid division by zero if min_val and max_val are equal
     if max_val == min_val:
-        # Handle the case where all values are the same
-        # You can choose to return zeros, ones, or any other suitable value
         return torch.zeros_like(tensor)
     else:
         scaled_tensor = (tensor - min_val) / (max_val - min_val)
@@ -168,8 +156,6 @@ def standardize(tensor, mean, std):
 
     # Avoid division by zero if std is zero
     if std == 0:
-        # Handle the case where all values are the same
-        # You can choose to return zeros, ones, or any other suitable value
         return torch.zeros_like(tensor)
     else:
         standardized_tensor = (tensor - mean) / std
@@ -249,7 +235,7 @@ class LTSMDataset(Dataset):
         # Apply radial distance filter
         if self.use_polar:
             # For polar: range is in column 1
-            pc = pc[pc[:, 1] <= self.max_radial_distance * 14500]  # Convert to meters
+            pc = pc[pc[:, 1] <= self.max_radial_distance * 14500]
         else:
             # For Cartesian: compute radial distance
             radial_distance = np.sqrt(pc[:, 0]**2 + pc[:, 1]**2 + pc[:, 2]**2)
@@ -259,7 +245,6 @@ class LTSMDataset(Dataset):
 
     def standardize_features(self, pc_tensor):
         if self.use_polar:
-            # Determine advection
             # Polar coordinate normalization
             # Azimuth: [-180, 180] -> [-1, 1]
             pc_tensor[:, 0] = pc_tensor[:, 0] / 180
@@ -272,10 +257,6 @@ class LTSMDataset(Dataset):
             pc_tensor[:, 3] = (cnr_clipped + 40) / 50  # [0, 1]
             pc_tensor = pc_tensor[:, :-1]
         else:
-            # Original Cartesian normalization (keep your existing logic)
-            #print(f"PC Tensor is: {pc_tensor.shape}")
-            enhanced_tensor = self.add_xyz_advection_features(pc_tensor)
-            pc_tensor[:, 7] = enhanced_tensor
             pc_tensor = pc_tensor[:, :-1]
             for i in range(3):
                 pc_tensor[:, i] = (pc_tensor[:, i] - self.feature_stats['mean'][i]) / self.feature_stats['std'][i]
@@ -285,7 +266,7 @@ class LTSMDataset(Dataset):
         return pc_tensor
 
     def downsample_point_cloud(self, pc, target_points):
-        # Keep your existing logic
+        
         N = pc.shape[0]
         if N < target_points:
             pad = np.zeros((target_points-N, pc.shape[1]), dtype=np.float32)
@@ -293,11 +274,9 @@ class LTSMDataset(Dataset):
         elif N > target_points:
             idx = np.random.choice(N, target_points, replace=False)
             pc = pc[idx]
-        #pc = self.add_advection_features(pc)
         return torch.from_numpy(pc).float()
 
     def __getitem__(self, idx):
-        # Keep your existing logic
         times = self.seq_list[idx]
         pcs = []
         for i in range(self.T+1):
@@ -321,25 +300,6 @@ class LTSMDataset(Dataset):
         if not batch: return {}
         keys = batch[0].keys()
         return {k: torch.stack([b[k] for b in batch], dim=0) for k in keys}
-
-    def add_polar_advection_features(self, pc_tensor):
-        cnr = pc_tensor[:, 3]
-        wind_r = pc_tensor[:, 4]      # Radial wind
-        wind_theta = pc_tensor[:, 5]  # Azimuthal wind
-        wind_z = pc_tensor[:, 6]      # Vertical wind
-        range_vals = pc_tensor[:, 1]  # Range coordinate
-
-        # Proper polar gradients (still approximate without spatial grid structure)
-        if cnr.numel() > 1:
-            cnr_grad_r = torch.gradient(cnr, dim=0)[0]
-            cnr_grad_theta = torch.gradient(cnr, dim=0)[0] / (range_vals + 1e-6)  # Scaled by radius
-            cnr_grad_z = torch.gradient(cnr, dim=0)[0]
-        else:
-            cnr_grad_r = cnr_grad_theta = cnr_grad_z = torch.zeros_like(cnr)
-
-        # 3D polar advection
-        advection = wind_r * cnr_grad_r + wind_theta * cnr_grad_theta + wind_z * cnr_grad_z
-        return advection
 
 class WeatherEnhancedLTSMDataset(LTSMDataset):
     def __init__(self, root_dir, seq_list, weather_csv_path, T=6, use_polar=False):
@@ -374,7 +334,18 @@ class WeatherEnhancedLTSMDataset(LTSMDataset):
             'PRSUM1H': (0.0, 50.0),
         }
 
-    # In your dataset __init__ or validation loop
+        if use_polar:
+            self.grad_dir = os.path.join(root_dir, 'gradients_polar')
+        else:
+            self.grad_dir = os.path.join(root_dir, 'gradients')
+        
+        # Check if gradients exist
+        self.has_precomputed_gradients = os.path.exists(self.grad_dir)
+        
+        if not self.has_precomputed_gradients:
+            print("WARNING: No precomputed gradients found. Will compute on-the-fly (slow!)")
+            print(f"Run precompute_gradients.py to create {self.grad_dir}")
+
     def verify_geometric_consistency(self):
         """Check if all point clouds have consistent geometry"""
         sample_scans = []
@@ -382,9 +353,9 @@ class WeatherEnhancedLTSMDataset(LTSMDataset):
             pc = self.load_point_cloud(self.seq_list[i][0])
             if pc is not None:
                 # Get azimuth, range, elevation
-                coords = pc[:, :3]  # Assuming these are az, range, el
+                coords = pc[:, :3]
                 sample_scans.append(coords)
-        
+
         # Check if all scans have same shape and similar coordinate distributions
         for i, scan in enumerate(sample_scans):
             print(f"Scan {i}: shape={scan.shape}, "
@@ -476,161 +447,217 @@ class WeatherEnhancedLTSMDataset(LTSMDataset):
             features.append(normalized)
 
         return np.array(features, dtype=np.float32)
-    
+
     def compute_upwind_cnr_polar(self, pc_tensor, precomputed_indices, dt=600):
         """
         Compute upwind CNR using pre-computed neighbor indices
-        
+
         pc_tensor: [N, 7] - [azimuth_deg, range_m, elevation_deg, cnr, wind_r, wind_t, wind_v]
         precomputed_indices: [N, k] - pre-computed k nearest neighbors for each point
         """
         N = pc_tensor.shape[0]
         k = precomputed_indices.shape[1]
-        
+
         # Ensure indices are on the same device as pc_tensor
         precomputed_indices = precomputed_indices.to(pc_tensor.device)
-        
+
         azimuth = pc_tensor[:, 0]
         range_m = pc_tensor[:, 1]
         elevation = pc_tensor[:, 2]
         current_cnr = pc_tensor[:, 3]
-        
+
         wind_radial = pc_tensor[:, 4]
         wind_tangential = pc_tensor[:, 5]
         wind_vertical = pc_tensor[:, 6]
-        
+
         # Convert to radians
         az_rad = torch.deg2rad(azimuth)
         el_rad = torch.deg2rad(elevation)
-        
+
         # Polar to Cartesian
         x = range_m * torch.cos(el_rad) * torch.cos(az_rad)
         y = range_m * torch.cos(el_rad) * torch.sin(az_rad)
         z = range_m * torch.sin(el_rad)
-        
+
         # Wind displacement components
         dx_radial = wind_radial * torch.cos(el_rad) * torch.cos(az_rad)
         dy_radial = wind_radial * torch.cos(el_rad) * torch.sin(az_rad)
         dz_radial = wind_radial * torch.sin(el_rad)
-        
+
         dx_tangential = -wind_tangential * torch.sin(az_rad)
         dy_tangential = wind_tangential * torch.cos(az_rad)
-        
+
         # Source positions (where air came from)
         source_x = x - (dx_radial + dx_tangential) * dt
         source_y = y - (dy_radial + dy_tangential) * dt
         source_z = z - (dz_radial + wind_vertical) * dt
-        
-        current_positions = torch.stack([x, y, z], dim=1)  # [N, 3]
-        source_positions = torch.stack([source_x, source_y, source_z], dim=1)  # [N, 3]
-        
-        # Gather neighbor positions - simple indexing without batch dimension
-        neighbor_positions = current_positions[precomputed_indices]  # [N, k, 3]
-        
-        # Compute distances from source to pre-computed neighbors
-        source_expanded = source_positions.unsqueeze(1)  # [N, 1, 3]
-        distances = torch.norm(neighbor_positions - source_expanded, dim=2)  # [N, k]
-        
+
+        current_positions = torch.stack([x, y, z], dim=1)
+        source_positions = torch.stack([source_x, source_y, source_z], dim=1)
+
+        # Gather neighbor
+        neighbor_positions = current_positions[precomputed_indices]
+
+        # Compute distances from source
+        source_expanded = source_positions.unsqueeze(1)
+        distances = torch.norm(neighbor_positions - source_expanded, dim=2)
+
         # Find closest among pre-computed neighbors
-        closest_idx = distances.argmin(dim=1)  # [N]
-        
+        closest_idx = distances.argmin(dim=1)
+
         # Map back to actual point indices
         point_idx = torch.arange(N, device=pc_tensor.device)
-        upwind_point_idx = precomputed_indices[point_idx, closest_idx]  # [N]
-        
+        upwind_point_idx = precomputed_indices[point_idx, closest_idx]
+
         # Get upwind CNR
         upwind_cnr = current_cnr[upwind_point_idx]
         advection_delta = upwind_cnr - current_cnr
 
-        # In compute_upwind_cnr_polar, add once at the start:
-        # Check if precomputed neighbors are actually close
-        N = min(100, pc_tensor.shape[0])  # Sample first 100 points
-        for i in range(N):
-            # Get positions of precomputed neighbors
-            neighbor_positions = current_positions[precomputed_indices[i]]  # [k, 3]
-            # Compute actual distances
-            distances = torch.norm(neighbor_positions - current_positions[i], dim=1)
-            
-            if distances.max() > 5000:  # If neighbors are >5km away, something's wrong
-                print(f"WARNING: Point {i} has distant neighbors: {distances.cpu().numpy()}")
-                print(f"This suggests KNN indices don't match point cloud structure")
-                break
-            
         return upwind_cnr, advection_delta
+    
+    def compute_radial_gradient_polar(self, pc_tensor):
+        """
+        Compute absolute CNR change along radial direction
+        
+        Returns:
+            radial_grad: [N] - Absolute CNR change (range: [-1, 1])
+            beam_cnr_std: [N] - CNR std within beam
+            boundary_proximity: [N] - Normalized distance to strong gradients
+        """
+        N = pc_tensor.shape[0]
+        device = pc_tensor.device
+        
+        # Extract features
+        azimuth, range_m, elevation, cnr = pc_tensor[:, 0], pc_tensor[:, 1], pc_tensor[:, 2], pc_tensor[:, 3]
+        
+        # Create beam IDs
+        az_bins = torch.round(azimuth).long()
+        el_bins = torch.round(elevation).long()
+        beam_id = (az_bins + 360) * 1000 + (el_bins + 90)
+        
+        # Initialize outputs
+        radial_grad = torch.zeros(N, device=device)
+        beam_cnr_std = torch.zeros(N, device=device)
+        boundary_proximity = torch.ones(N, device=device) * 10.0
+        
+        # Process each beam
+        for beam in torch.unique(beam_id):
+            mask = beam_id == beam
+            indices = torch.where(mask)[0]
+            
+            if len(indices) < 2:
+                continue
+            
+            # Sort by range
+            beam_ranges = range_m[indices]
+            beam_cnrs = cnr[indices]
+            sorted_idx = torch.argsort(beam_ranges)
+            
+            # Sorted data
+            sorted_cnrs = beam_cnrs[sorted_idx]
+            sorted_ranges = beam_ranges[sorted_idx]
+            orig_indices = indices[sorted_idx]
+            
+            cnr_changes = torch.diff(sorted_cnrs)
+            
+            radial_grad[orig_indices[:-1]] = cnr_changes
+            radial_grad[orig_indices[-1]] = cnr_changes[-1] if len(cnr_changes) > 0 else 0.0
+            
+            beam_cnr_std[indices] = torch.std(beam_cnrs) if len(beam_cnrs) > 1 else 0.0
+            
+            strong_boundaries = torch.abs(cnr_changes) > 0.3
+            if strong_boundaries.any():
+                boundary_locs = sorted_ranges[:-1][strong_boundaries]
+                median_spacing = torch.median(torch.diff(sorted_ranges))
+                
+                for i, idx in enumerate(orig_indices):
+                    if len(boundary_locs) > 0:
+                        dist = torch.min(torch.abs(boundary_locs - sorted_ranges[i]))
+                        boundary_proximity[idx] = torch.clamp(dist / (median_spacing + 1e-6), 0.0, 10.0)
+        
+        return radial_grad.unsqueeze(1), beam_cnr_std.unsqueeze(1), boundary_proximity.unsqueeze(1)
 
+    def load_radial_gradient(self, dt):
+        """Load precomputed radial gradient for a timestamp"""
+        if not self.has_precomputed_gradients:
+            return None
+        
+        if self.use_polar:
+            fname = f"{dt.strftime('%Y-%m-%d')}_{dt.hour}_{dt.strftime('%M')}_polar.npy"
+        else:
+            fname = f"{dt.strftime('%Y-%m-%d')}_{dt.hour}_{dt.strftime('%M')}.npy"
+        
+        grad_path = os.path.join(self.grad_dir, fname)
+        
+        if not os.path.exists(grad_path):
+            print(f"Missing gradient file: {grad_path}")
+            return None
+        
+        return np.load(grad_path)
+    
     def __getitem__(self, idx):
         times = self.seq_list[idx]
         pcs = []
-        #self.verify_geometric_consistency()
 
-        # Load T+1 frames using parent's load_point_cloud
+        # Load T+1 frames
         for i in range(self.T + 1):
             pc = self.load_point_cloud(times[i])
             if pc is None:
                 return None
             pcs.append(pc)
 
-        # Uniform size (parent's method)
+        # Uniform size
         max_points = max(pc.shape[0] for pc in pcs)
         pcs_tensor = []
 
         for i, pc in enumerate(pcs):
-            # Downsample/pad to uniform size
             pc_tensor = self.downsample_point_cloud(pc, max_points)
-
-            # Standardize using parent's method (handles polar/cartesian)
             pc_tensor = self.standardize_features(pc_tensor)
 
-            # Get the right indices for this point cloud size
+            # Get indices
             if hasattr(self, 'precomputed_indices') and max_points in self.precomputed_indices:
-                # If you have a dict mapping size -> indices
-                indices = self.precomputed_indices[max_points]  # Should be [N, k]
+                indices = self.precomputed_indices[max_points]
             else:
-                # precomputed_indices_tensor is [B, N, k] where B is index for different sizes
-                # You need to select the right slice - this assumes max_points maps to a B index
-                # Option 1: If precomputed_indices_tensor has max_points as first dim
-                indices = precomputed_indices_tensor[0, :max_points, :]  # [max_points, k]
-                
-                # Option 2: If you have a mapping of sizes to indices
-                # size_idx = size_to_index_map[max_points]
-                # indices = precomputed_indices_tensor[size_idx, :max_points, :]
-            
-            # Compute upwind features using pre-computed indices
+                indices = precomputed_indices_tensor[0, :max_points, :]
+
+            # Compute upwind features
             if self.use_polar:
                 upwind_cnr, advection_delta = self.compute_upwind_cnr_polar(
-                    pc_tensor,  # [N, 7]
-                    indices     # [N, k]
+                    pc_tensor, indices
                 )
-                upwind_cnr_expanded = upwind_cnr.unsqueeze(1)  # [N, 1]
-                advection_delta_expanded = advection_delta.unsqueeze(1)  # [N, 1]
+                upwind_cnr_expanded = upwind_cnr.unsqueeze(1)
+                advection_delta_expanded = advection_delta.unsqueeze(1)
+                radial_grad_np = self.load_radial_gradient(times[i])
+                
+                if radial_grad_np is not None:
+                    # Downsample/pad gradient to match point cloud
+                    N_orig = radial_grad_np.shape[0]
+                    if N_orig < max_points:
+                        # Pad with zeros
+                        pad = np.zeros(max_points - N_orig, dtype=np.float32)
+                        radial_grad_np = np.concatenate([radial_grad_np, pad])
+                    elif N_orig > max_points:
+                        radial_grad_np = radial_grad_np[:max_points]
+                    
+                    radial_grad = torch.from_numpy(radial_grad_np).float().unsqueeze(1)
+                else:
+                    # Fallback: compute on-the-fly
+                    radial_grad, _, _ = self.compute_radial_gradient_polar(pc_tensor)
             else:
                 N = pc_tensor.shape[0]
                 upwind_cnr_expanded = torch.zeros(N, 1, device=pc_tensor.device)
                 advection_delta_expanded = torch.zeros(N, 1, device=pc_tensor.device)
+                radial_grad = torch.zeros(N, 1, device=pc_tensor.device)
 
-            # Get weather features for this timestamp
-            #weather_features = self.get_weather_features_normalized(times[i])
-
-            # Check if weather data is available
-            #if weather_features is None or np.isnan(weather_features).any():
-                #return None
-
-            # Broadcast weather to all points
-            #N = pc_tensor.shape[0]
-            #weather_broadcasted = np.tile(weather_features, (N, 1))
-            #weather_tensor = torch.from_numpy(weather_broadcasted).float()
-
-            # Concatenate all features:
+            # Concatenate features
             enhanced_pc = torch.cat([
-                pc_tensor,                    # 7 features
-                upwind_cnr_expanded,          # 1 feature
-                advection_delta_expanded     # 1 feature 
-                #weather_tensor                # 6 features
+                pc_tensor,
+                upwind_cnr_expanded,
+                advection_delta_expanded
             ], dim=1)
 
             pcs_tensor.append(enhanced_pc)
 
-        # Return dictionary
         return {f'pc{i}': pc for i, pc in enumerate(pcs_tensor)}
 
 def save(x, model):
@@ -645,10 +672,10 @@ def save(x, model):
 
             # Get all point cloud keys dynamically
             pc_keys = [key for key in batch.keys() if key.startswith('pc')]
-            pc_keys.sort()  # Ensure correct order: pc0, pc1, pc2, ...
+            pc_keys.sort()  # Ensure correct order
 
             # Check if we have enough point clouds
-            if len(pc_keys) < T + 1:  # Need T inputs + 1 target
+            if len(pc_keys) < T + 1:
                 print("Insufficient point clouds in batch.")
                 continue
 
@@ -669,13 +696,11 @@ def save(x, model):
                 continue
 
             # Split into inputs and target
-            input_pcs = point_clouds[:T]  # First T point clouds for input
-            target_pc = point_clouds[T]   # Last point cloud for target
-            # Stack the input point clouds: [B, T, N, F]
+            input_pcs = point_clouds[:T]
+            target_pc = point_clouds[T]
             x = torch.stack(input_pcs, dim=1)
 
-            # Your target point clouds (adjust indices based on your needs)
-            pc_current = point_clouds[T-1]  # Second-to-last for current state
+            pc_current = point_clouds[T-1]
             pc_target = target_pc
 
             pred_next_feat, pred_delta = model(x, precomputed_indices_tensor)

@@ -34,7 +34,6 @@ def gather_neighbors(x, idx):
 
     idx_flat = idx.view(B, N * idx.shape[-1])
     batch_indices = torch.arange(B, device = x.device, dtype=torch.long).unsqueeze(1).repeat(1, N * idx.shape[-1])
-    # This avoids creating the large [B, N, N, C] intermediate tensor
     gathered_flat = x[batch_indices, idx_flat]
 
     # Reshape the gathered tensor to the final output shape
@@ -94,22 +93,16 @@ class CloudLSTMNextScan(nn.Module):
         self.cell = CloudLSTMCell(in_dim=in_dim, hidden_dim=hidden_dim, msg_dim=msg_dim, k=k)
 
         # Number of features to predict (non-xyz)
-        self.pred_dim = 1  # (8-3=5)
+        self.pred_dim = 1
 
-        # The head now has two separate branches for mean and log-std
+        # The Prediction head 
         self.mean_head = nn.Sequential(
             nn.Linear(hidden_dim, 128), nn.ReLU(),
             nn.Linear(128, 64), nn.ReLU(),
             nn.Linear(64, self.pred_dim), # Outputs the predicted mean (delta features)
         )
 
-        self.log_std_head = nn.Sequential(
-            nn.Linear(hidden_dim, 128), nn.ReLU(),
-            nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, self.pred_dim),
-        )
-
-    def forward(self, x, precomputed_indices):  # x: [B,T,N,8]
+    def forward(self, x, precomputed_indices):  # x: [B,T,N,F]
         B, T, N, F = x.shape
         assert T >= 2, "Need at least two frames (t-1, t)."
 
@@ -122,27 +115,27 @@ class CloudLSTMNextScan(nn.Module):
         h = c = None
         # Unroll over time (uses per-frame xyz for neighborhoods)
         for t in range(T):
-            feat_t = x[:, t, :, :]      # [B,N,8] (all features)
+            feat_t = x[:, t, :, :]
             h, c = self.cell(feat_t, precomputed_indices, h, c)
 
-        # Predict the delta features as the mean of the distribution
+        # Predict the delta CNR
         pred_delta_features = self.mean_head(h)  # [B,N,1]
 
         # Get the last full feature vector (xyz + additional features)
-        last_features = x[:, -1, :, :7]      # [B,N,8] (features at time t)
+        last_features = x[:, -1, :, :7]
 
-        # Get the constant xyz coordinates from the last frame
+        # Get the constant coordinates from the last frame
         last_xyz = last_features[:, :, :3] # [B,N,3]
 
         # Get the additional features from the last frame
-        last_additional_features = last_features[:, :, 3:4] # [B,N,1]
-        last_wind_features = last_features[:, :, 4:7] #[B,N,4]
+        last_additional_features = last_features[:, :, 3:4]
+        last_wind_features = last_features[:, :, 4:7]
 
-        # Predict the next additional feature vector by adding the mean delta
-        pred_next_additional_feat = last_additional_features + pred_delta_features # [B,N,5]
+        # Predict the next additional feature vector by adding the delta
+        pred_next_additional_feat = last_additional_features + pred_delta_features
 
-        # Concatenate the constant xyz with the new predicted additional features
-        pred_next_feat = torch.cat([last_xyz, pred_next_additional_feat, last_wind_features], dim=-1) # [B,N,8]
+        # Concatenate the constant's with the new predicted CNR
+        pred_next_feat = torch.cat([last_xyz, pred_next_additional_feat, last_wind_features], dim=-1)
 
         return pred_next_feat, pred_delta_features
 
@@ -152,8 +145,6 @@ def min_max_scale(tensor, min_val, max_val):
 
     # Avoid division by zero if min_val and max_val are equal
     if max_val == min_val:
-        # Handle the case where all values are the same
-        # You can choose to return zeros, ones, or any other suitable value
         return torch.zeros_like(tensor)
     else:
         scaled_tensor = (tensor - min_val) / (max_val - min_val)
@@ -165,8 +156,6 @@ def standardize(tensor, mean, std):
 
     # Avoid division by zero if std is zero
     if std == 0:
-        # Handle the case where all values are the same
-        # You can choose to return zeros, ones, or any other suitable value
         return torch.zeros_like(tensor)
     else:
         standardized_tensor = (tensor - mean) / std
@@ -246,7 +235,7 @@ class LTSMDataset(Dataset):
         # Apply radial distance filter
         if self.use_polar:
             # For polar: range is in column 1
-            pc = pc[pc[:, 1] <= self.max_radial_distance * 14500]  # Convert to meters
+            pc = pc[pc[:, 1] <= self.max_radial_distance * 14500]
         else:
             # For Cartesian: compute radial distance
             radial_distance = np.sqrt(pc[:, 0]**2 + pc[:, 1]**2 + pc[:, 2]**2)
@@ -256,7 +245,6 @@ class LTSMDataset(Dataset):
 
     def standardize_features(self, pc_tensor):
         if self.use_polar:
-            # Determine advection
             # Polar coordinate normalization
             # Azimuth: [-180, 180] -> [-1, 1]
             pc_tensor[:, 0] = pc_tensor[:, 0] / 180
@@ -269,10 +257,6 @@ class LTSMDataset(Dataset):
             pc_tensor[:, 3] = (cnr_clipped + 40) / 50  # [0, 1]
             pc_tensor = pc_tensor[:, :-1]
         else:
-            # Original Cartesian normalization (keep your existing logic)
-            #print(f"PC Tensor is: {pc_tensor.shape}")
-            enhanced_tensor = self.add_xyz_advection_features(pc_tensor)
-            pc_tensor[:, 7] = enhanced_tensor
             pc_tensor = pc_tensor[:, :-1]
             for i in range(3):
                 pc_tensor[:, i] = (pc_tensor[:, i] - self.feature_stats['mean'][i]) / self.feature_stats['std'][i]
@@ -282,7 +266,7 @@ class LTSMDataset(Dataset):
         return pc_tensor
 
     def downsample_point_cloud(self, pc, target_points):
-        # Keep your existing logic
+        
         N = pc.shape[0]
         if N < target_points:
             pad = np.zeros((target_points-N, pc.shape[1]), dtype=np.float32)
@@ -290,11 +274,9 @@ class LTSMDataset(Dataset):
         elif N > target_points:
             idx = np.random.choice(N, target_points, replace=False)
             pc = pc[idx]
-        #pc = self.add_advection_features(pc)
         return torch.from_numpy(pc).float()
 
     def __getitem__(self, idx):
-        # Keep your existing logic
         times = self.seq_list[idx]
         pcs = []
         for i in range(self.T+1):
@@ -318,25 +300,6 @@ class LTSMDataset(Dataset):
         if not batch: return {}
         keys = batch[0].keys()
         return {k: torch.stack([b[k] for b in batch], dim=0) for k in keys}
-
-    def add_polar_advection_features(self, pc_tensor):
-        cnr = pc_tensor[:, 3]
-        wind_r = pc_tensor[:, 4]      # Radial wind
-        wind_theta = pc_tensor[:, 5]  # Azimuthal wind
-        wind_z = pc_tensor[:, 6]      # Vertical wind
-        range_vals = pc_tensor[:, 1]  # Range coordinate
-
-        # Proper polar gradients (still approximate without spatial grid structure)
-        if cnr.numel() > 1:
-            cnr_grad_r = torch.gradient(cnr, dim=0)[0]
-            cnr_grad_theta = torch.gradient(cnr, dim=0)[0] / (range_vals + 1e-6)  # Scaled by radius
-            cnr_grad_z = torch.gradient(cnr, dim=0)[0]
-        else:
-            cnr_grad_r = cnr_grad_theta = cnr_grad_z = torch.zeros_like(cnr)
-
-        # 3D polar advection
-        advection = wind_r * cnr_grad_r + wind_theta * cnr_grad_theta + wind_z * cnr_grad_z
-        return advection
 
 class WeatherEnhancedLTSMDataset(LTSMDataset):
     def __init__(self, root_dir, seq_list, weather_csv_path, T=6, use_polar=False):
@@ -383,7 +346,6 @@ class WeatherEnhancedLTSMDataset(LTSMDataset):
             print("WARNING: No precomputed gradients found. Will compute on-the-fly (slow!)")
             print(f"Run precompute_gradients.py to create {self.grad_dir}")
 
-    # In your dataset __init__ or validation loop
     def verify_geometric_consistency(self):
         """Check if all point clouds have consistent geometry"""
         sample_scans = []
@@ -391,7 +353,7 @@ class WeatherEnhancedLTSMDataset(LTSMDataset):
             pc = self.load_point_cloud(self.seq_list[i][0])
             if pc is not None:
                 # Get azimuth, range, elevation
-                coords = pc[:, :3]  # Assuming these are az, range, el
+                coords = pc[:, :3]
                 sample_scans.append(coords)
 
         # Check if all scans have same shape and similar coordinate distributions
@@ -530,44 +492,29 @@ class WeatherEnhancedLTSMDataset(LTSMDataset):
         source_y = y - (dy_radial + dy_tangential) * dt
         source_z = z - (dz_radial + wind_vertical) * dt
 
-        current_positions = torch.stack([x, y, z], dim=1)  # [N, 3]
-        source_positions = torch.stack([source_x, source_y, source_z], dim=1)  # [N, 3]
+        current_positions = torch.stack([x, y, z], dim=1)
+        source_positions = torch.stack([source_x, source_y, source_z], dim=1)
 
-        # Gather neighbor positions - simple indexing without batch dimension
-        neighbor_positions = current_positions[precomputed_indices]  # [N, k, 3]
+        # Gather neighbor
+        neighbor_positions = current_positions[precomputed_indices]
 
-        # Compute distances from source to pre-computed neighbors
-        source_expanded = source_positions.unsqueeze(1)  # [N, 1, 3]
-        distances = torch.norm(neighbor_positions - source_expanded, dim=2)  # [N, k]
+        # Compute distances from source
+        source_expanded = source_positions.unsqueeze(1)
+        distances = torch.norm(neighbor_positions - source_expanded, dim=2)
 
         # Find closest among pre-computed neighbors
-        closest_idx = distances.argmin(dim=1)  # [N]
+        closest_idx = distances.argmin(dim=1)
 
         # Map back to actual point indices
         point_idx = torch.arange(N, device=pc_tensor.device)
-        upwind_point_idx = precomputed_indices[point_idx, closest_idx]  # [N]
+        upwind_point_idx = precomputed_indices[point_idx, closest_idx]
 
         # Get upwind CNR
         upwind_cnr = current_cnr[upwind_point_idx]
         advection_delta = upwind_cnr - current_cnr
 
-        # In compute_upwind_cnr_polar, add once at the start:
-        # Check if precomputed neighbors are actually close
-        N = min(100, pc_tensor.shape[0])  # Sample first 100 points
-        for i in range(N):
-            # Get positions of precomputed neighbors
-            neighbor_positions = current_positions[precomputed_indices[i]]  # [k, 3]
-            # Compute actual distances
-            distances = torch.norm(neighbor_positions - current_positions[i], dim=1)
-
-            if distances.max() > 500:  # If neighbors are >5km away, something's wrong
-                print(f"WARNING: Point {i} has distant neighbors: {distances.cpu().numpy()}")
-                print(f"This suggests KNN indices don't match point cloud structure")
-                break
-
         return upwind_cnr, advection_delta
     
-    # Your complete gradient computation - SIMPLE VERSION
     def compute_radial_gradient_polar(self, pc_tensor):
         """
         Compute absolute CNR change along radial direction
@@ -611,17 +558,13 @@ class WeatherEnhancedLTSMDataset(LTSMDataset):
             sorted_ranges = beam_ranges[sorted_idx]
             orig_indices = indices[sorted_idx]
             
-            # === ABSOLUTE CHANGE ===
             cnr_changes = torch.diff(sorted_cnrs)
             
-            # Assign to points
             radial_grad[orig_indices[:-1]] = cnr_changes
             radial_grad[orig_indices[-1]] = cnr_changes[-1] if len(cnr_changes) > 0 else 0.0
             
-            # Beam statistics
             beam_cnr_std[indices] = torch.std(beam_cnrs) if len(beam_cnrs) > 1 else 0.0
             
-            # Boundary proximity
             strong_boundaries = torch.abs(cnr_changes) > 0.3
             if strong_boundaries.any():
                 boundary_locs = sorted_ranges[:-1][strong_boundaries]
@@ -684,8 +627,6 @@ class WeatherEnhancedLTSMDataset(LTSMDataset):
                 )
                 upwind_cnr_expanded = upwind_cnr.unsqueeze(1)
                 advection_delta_expanded = advection_delta.unsqueeze(1)
-                """
-                # NEW: Load precomputed gradient
                 radial_grad_np = self.load_radial_gradient(times[i])
                 
                 if radial_grad_np is not None:
@@ -696,16 +637,12 @@ class WeatherEnhancedLTSMDataset(LTSMDataset):
                         pad = np.zeros(max_points - N_orig, dtype=np.float32)
                         radial_grad_np = np.concatenate([radial_grad_np, pad])
                     elif N_orig > max_points:
-                        # Use same indices as point cloud downsampling
-                        # This is tricky - you need to track which indices were used
-                        # For now, just take first max_points
                         radial_grad_np = radial_grad_np[:max_points]
                     
                     radial_grad = torch.from_numpy(radial_grad_np).float().unsqueeze(1)
                 else:
                     # Fallback: compute on-the-fly
                     radial_grad, _, _ = self.compute_radial_gradient_polar(pc_tensor)
-                """
             else:
                 N = pc_tensor.shape[0]
                 upwind_cnr_expanded = torch.zeros(N, 1, device=pc_tensor.device)
@@ -723,7 +660,7 @@ class WeatherEnhancedLTSMDataset(LTSMDataset):
 
         return {f'pc{i}': pc for i, pc in enumerate(pcs_tensor)}
 
-# Loss that emphasizes what matters
+# Loss with no additional weightings
 def adaptive_loss(pred_cnr, tgt_cnr, prev_cnr):
     """
     Loss that focuses on dynamic regions while maintaining overall accuracy
@@ -746,15 +683,11 @@ def adaptive_loss(pred_cnr, tgt_cnr, prev_cnr):
     # 4. Variance preservation
     loss_var = torch.abs(pred_cnr.std() - tgt_cnr.std())
     
-    # Weighted combination
-    # - Base MSE ensures we don't break easy cases
-    # - Dynamic loss focuses on what matters
-    # - Delta ensures temporal consistency
-    # - Variance prevents collapse
     loss = 0.3 * loss_mse + 0.4 * loss_dynamic + 0.2 * loss_delta + 0.1 * loss_var
     
     return loss
 
+# Loss with adaptive MSE weighting
 def adaptive_loss_with_cnr_weighting(pred_cnr, tgt_cnr, prev_cnr, 
                                       cnr_weight_power=2.0, 
                                       cnr_weight_scale=3.0):
@@ -762,7 +695,7 @@ def adaptive_loss_with_cnr_weighting(pred_cnr, tgt_cnr, prev_cnr,
     Adaptive loss with exponential weighting for high CNR values
     
     Args:
-        cnr_weight_power: How aggressively to weight high CNR (1.0=linear, 2.0=quadratic)
+        cnr_weight_power: How aggressively to weight high CNR
         cnr_weight_scale: Maximum weight multiplier for highest CNR
     """
     # 1. Base MSE for overall accuracy
@@ -783,12 +716,8 @@ def adaptive_loss_with_cnr_weighting(pred_cnr, tgt_cnr, prev_cnr,
     # 4. Variance preservation
     loss_var = torch.abs(pred_cnr.std() - tgt_cnr.std())
     
-    # Exponential weight: high CNR gets much more weight
+    # 5. Exponential weighting
     cnr_weights = 1.0 + (cnr_weight_scale - 1.0) * torch.pow(tgt_cnr, cnr_weight_power)
-    # Now: low CNR (clear air) → weight≈1.0
-    #      high CNR (clouds)   → weight≈cnr_weight_scale (e.g., 3.0)
-    
-    # Apply CNR weighting to prediction error
     weighted_error = cnr_weights * (pred_cnr - tgt_cnr) ** 2
     loss_cnr_weighted = weighted_error.mean()
     
@@ -797,20 +726,14 @@ def adaptive_loss_with_cnr_weighting(pred_cnr, tgt_cnr, prev_cnr,
             0.3 * loss_dynamic + 
             0.1 * loss_delta + 
             0.05 * loss_var +
-            0.35 * loss_cnr_weighted)  # Heavy weight on CNR-weighted term
+            0.35 * loss_cnr_weighted)
     
     return loss
 
+# Loss with adaptive and changing weighted Huber
 class ImprovedCloudDynamicsLoss(nn.Module):
     """
     Combines best of Experiment 171 with improved weighting
-    
-    Components:
-    1. Base MSE (global accuracy)
-    2. Dynamic region mask (|Δ| > 0.05 focus)
-    3. Temporal delta consistency
-    4. Variance preservation
-    5. Weighted Huber loss (robust to outliers)
     """
     def __init__(self, max_epochs=5, huber_delta=0.2, 
                  cloud_boost=1.5, dynamic_threshold=0.05):
@@ -827,30 +750,16 @@ class ImprovedCloudDynamicsLoss(nn.Module):
     def forward(self, pred_cnr, tgt_cnr, prev_cnr, radial_grad=None):
         """
         Compute multi-component cloud-aware loss
-        
-        Args:
-            pred_cnr: [B, N, 1] - predicted CNR
-            tgt_cnr: [B, N, 1] - target CNR  
-            prev_cnr: [B, N, 1] - previous CNR
-            radial_grad: [B, N, 1] - optional radial gradient (not used yet)
-        
-        Returns:
-            loss: scalar
-            loss_dict: dict with component losses (for logging)
         """
         
         # Compute deltas
         pred_delta = pred_cnr - prev_cnr
         tgt_delta = tgt_cnr - prev_cnr
         
-        # ============================================================
-        # COMPONENT 1: Base MSE (global accuracy)
-        # ============================================================
+        # 1: Base MSE (global accuracy)
         loss_mse = F.mse_loss(pred_cnr, tgt_cnr)
         
-        # ============================================================
-        # COMPONENT 2: Dynamic Region Emphasis (|Δ| > threshold)
-        # ============================================================
+        # 2: Dynamic Region Emphasis (|Δ| > threshold)
         dynamic_mask = torch.abs(tgt_delta) > self.dynamic_threshold
         
         if dynamic_mask.any():
@@ -861,22 +770,15 @@ class ImprovedCloudDynamicsLoss(nn.Module):
         else:
             loss_dynamic = torch.tensor(0.0, device=pred_cnr.device)
         
-        # ============================================================
-        # COMPONENT 3: Temporal Delta Consistency
-        # ============================================================
+        # 3: Temporal Delta Consistency
         loss_delta = F.mse_loss(pred_delta, tgt_delta)
         
-        # ============================================================
-        # COMPONENT 4: Variance Preservation (prevent collapse)
-        # ============================================================
+        # 4: Variance Preservation (prevent collapse)
         pred_std = pred_cnr.std()
         tgt_std = tgt_cnr.std()
         loss_var = torch.abs(pred_std - tgt_std)
         
-        # ============================================================
-        # COMPONENT 5: Weighted Huber Loss
-        # ============================================================
-        
+        # 5: Weighted Huber Loss
         # Progressive scheduling
         progress = min(self.current_epoch / self.max_epochs, 1.0)
         
@@ -884,9 +786,8 @@ class ImprovedCloudDynamicsLoss(nn.Module):
         cnr = prev_cnr.squeeze(-1)
         target_d = tgt_delta.squeeze(-1)
         
-        # --- Dynamic magnitude weight ---
-        # Emphasize large changes progressively
-        beta = 1.5 + 0.5 * progress  # 1.5 → 2.0
+        # Dynamic magnitude weight -> Emphasize large changes progressively
+        beta = 1.5 + 0.5 * progress
         dynamic_weight = torch.pow(torch.abs(target_d), beta)
         
         # Normalize to [0, 1]
@@ -895,50 +796,39 @@ class ImprovedCloudDynamicsLoss(nn.Module):
         else:
             dynamic_weight = torch.zeros_like(dynamic_weight)
         
-        # --- Cloud region weight ---
-        # Moderate boost for high-CNR regions
+        # Cloud region weight -> Moderate boost for high-CNR regions
         cloud_threshold = 0.4
         cloud_mask_w = (cnr > cloud_threshold).float()
         cloud_excess = torch.clamp(cnr - cloud_threshold, min=0)
         cloud_weight = 1.0 + self.cloud_boost * cloud_excess * cloud_mask_w
         
-        # --- Boundary weight (optional) ---
+        # Boundary weight
         if radial_grad is not None:
             grad = radial_grad.squeeze(-1)
             is_boundary = (torch.abs(grad) > 0.3).float()
-            boundary_weight = 1.0 + 0.5 * is_boundary  # Moderate 1.5x boost
+            boundary_weight = 1.0 + 0.5 * is_boundary
         else:
             boundary_weight = 1.0
         
-        # --- Combine weights ---
-        # Progressive mixing: start balanced, end dynamic-focused
+        # Combine weights
         alpha = 0.4 - 0.2 * progress  # 0.4 → 0.2
         
         spatial_weight = cnr * cloud_weight * boundary_weight
         combined_weight = alpha * spatial_weight + (1 - alpha) * dynamic_weight
-        
-        # Clamp to reasonable range
         combined_weight = torch.clamp(combined_weight, min=0.3, max=2.0)
         
         # Apply to Huber loss
         combined_weight = combined_weight.unsqueeze(-1)  # [B, N, 1]
         loss_pointwise = self.huber(pred_delta, tgt_delta)
         weighted_loss = loss_pointwise * combined_weight
-        
-        # Normalize by sum of weights
         loss_weighted_huber = weighted_loss.sum() / (combined_weight.sum() + 1e-6)
         
-        # ============================================================
-        # COMBINE ALL COMPONENTS
-        # ============================================================
-        
-        # Weights similar to 171, but add Huber component
         loss = (
-            0.15 * loss_mse +              # Global accuracy
-            0.30 * loss_dynamic +          # Dynamic region focus
-            0.15 * loss_delta +            # Temporal consistency
-            0.05 * loss_var +              # Variance preservation
-            0.35 * loss_weighted_huber     # Robust weighted loss
+            0.15 * loss_mse +
+            0.30 * loss_dynamic +
+            0.15 * loss_delta +
+            0.05 * loss_var +
+            0.35 * loss_weighted_huber
         )
         
         # Loss components for logging
@@ -971,36 +861,15 @@ T=3
 files = sorted(os.listdir(os.path.join(lidar_dir, "diff_clouds")))
 datetimes = [datetime.strptime(f.split(".")[0], "%Y-%m-%d_%H_%M") for f in files]
 seqs = [datetimes[i:i+T+1] for i in range(len(datetimes)-T)]
-split1 = int(0.85 * len(seqs))
-split2 = int(1 * len(seqs))
-train_seqs = seqs[:split1]
-val_seqs = seqs[split1:]
-
-test_seqs = [
-    [datetime(2025,7,31,10,10), datetime(2025,7,31,10,10), datetime(2025,7,31,10,20), datetime(2025,7,31,10,30), datetime(2025,7,31,10,40), datetime(2025,7,31,10,50), datetime(2025,7,31,11,00),
-     datetime(2025,7,31,11,10), datetime(2025,7,31,11,20), datetime(2025,7,31,11,30), datetime(2025,7,31,11,40),
-     datetime(2025,7,31,11,50), datetime(2025,7,31,12,00)],
-
-    [datetime(2025,8,4,1,40), datetime(2025,8,4,1,50), datetime(2025,8,4,2,00), datetime(2025,8,4,2,10), datetime(2025,8,4,2,20), datetime(2025,8,4,2,30), datetime(2025,8,4,2,40),
-     datetime(2025,8,4,2,50), datetime(2025,8,4,3,00), datetime(2025,8,4,3,10), datetime(2025,8,4,3,20),
-     datetime(2025,8,4,3,30), datetime(2025,8,4,3,40)],
-
-    [datetime(2025,8,2,19,30), datetime(2025,8,2,19,50), datetime(2025,8,2,20,00), datetime(2025,8,2,20,20), datetime(2025,8,2,20,30), datetime(2025,8,2,20,40), datetime(2025,8,2,21,00),
-     datetime(2025,8,2,21,10), datetime(2025,8,2,21,30), datetime(2025,8,2,21,40), datetime(2025,8,2,21,50),
-     datetime(2025,8,2,22,00), datetime(2025,8,2,22,10)],
-
-    [datetime(2025,8,1,7,10), datetime(2025,8,1,7,20), datetime(2025,8,1,7,30), datetime(2025,8,1,7,40), datetime(2025,8,1,7,50), datetime(2025,8,1,8,00), datetime(2025,8,1,8,10),
-     datetime(2025,8,1,8,20), datetime(2025,8,1,8,30), datetime(2025,8,1,8,40), datetime(2025,8,1,8,50),
-     datetime(2025,8,1,9,00), datetime(2025,8,1,9,10)]
-]
+split = int(0.85 * len(seqs))
+train_seqs = seqs[:split]
+val_seqs = seqs[split:]
 
 train_dataset = WeatherEnhancedLTSMDataset(lidar_dir, train_seqs, weather_csv, T=T, use_polar=True)
 val_dataset = WeatherEnhancedLTSMDataset(lidar_dir, val_seqs, weather_csv, T=T, use_polar=True)
-test_dataset = WeatherEnhancedLTSMDataset(lidar_dir, test_seqs, weather_csv, T=T, use_polar=True)
 
 train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, drop_last=True)
 val_loader   = DataLoader(val_dataset,   batch_size=1, shuffle=False)
-test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, drop_last=True)
 
 model = CloudLSTMNextScan(in_dim=9, hidden_dim=384, msg_dim=96, k=32, T=T).to(device, dtype=torch.float32) # Ensure model parameters are float32
 optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-5)
@@ -1022,7 +891,7 @@ if os.path.exists(checkpoint_path):
     checkpoint = torch.load(checkpoint_path, map_location=device, pickle_module=pickle)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    print(f"Resumed from checkpoint at epoch {start_epoch}")
+    print(f"Resumed from checkpoint at epoch ")
 
 torch.cuda.empty_cache()
 starttime = time.time()
@@ -1033,7 +902,6 @@ criterion = ImprovedCloudDynamicsLoss(
         dynamic_threshold=0.05  # Focus on changes > 5 dB
     )
 print(f"Control Group pass {checkpoint_path}")
-
 
 model.eval()
 results = {

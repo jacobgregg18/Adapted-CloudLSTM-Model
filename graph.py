@@ -5,7 +5,7 @@ import math
 import os
 from datetime import datetime
 
-CNR_VALUE = 0.4
+RECON_CNR_VALUE = 0.4
 CNR_VALUE = -25
 
 mean_x, std_x = 2.7022033600688215e-06, 0.291664816512239
@@ -25,6 +25,7 @@ def undo_log_normalize_cnr(normalized_cnr):
     return cnr_shifted - cnr_shift
 
 def filter_reconstructed(data, radius_threshold_meters):
+    """Filter scans reconstructed using xyz coords"""
     
     distance_squared = np.sum(data[:, :3]**2, axis=1)
     combined_mask = (distance_squared < radius_threshold_meters**2) 
@@ -53,6 +54,8 @@ def filter_reconstructed(data, radius_threshold_meters):
     return filtered_x, filtered_y, filtered_z
 
 def filter_base(data):
+    """Filter base scans with no modifications"""
+    
     x = data[:, 0]
     y = data[:, 1]
     z = data[:, 2]
@@ -71,7 +74,8 @@ def filter_base(data):
     return filtered_x, filtered_y, filtered_z, filtered_cnr
 
 def filter_rae(data, radius_threshold_meters):
-
+    """Filter scans reconstructed using polar coords"""
+    
     mask = data[:, 1] < radius_threshold_meters
     data = data[mask]
     
@@ -90,7 +94,7 @@ def filter_rae(data, radius_threshold_meters):
     z = range_m * np.sin(el_rad)
 
     print(np.shape(data))
-    mask = cnr > CNR_VALUE
+    mask = cnr > RECON_CNR_VALUE
 
     # Apply the mask to all the arrays to get the filtered data
     filtered_x = x[mask]
@@ -112,32 +116,13 @@ recon_ground = np.load("diff_clouds/2025-08-14_2_30.npy")
 #previous = np.load("LSTM_Scans/LSTM_prior3.npy")
 previous = np.load("diff_clouds/2025-08-14_8_30.npy")
 
-#fig = plt.figure()
-#ax = fig.add_subplot(111, projection='3d')
-#ax.scatter(filtered_x, filtered_y, filtered_z, s=2)
-#plt.show()
 
 fig = plt.figure(figsize=(15, 5))
-#x_limits = (-0.75, 0.75)
-#y_limits = (-0.8,0.8)
-#z_limits = (0,0.8)
 x_limits = (-0.6, 0.6)
 y_limits = (-0.6,0.6)
 z_limits = (0,0.2)
 
-# --- Base Reconstrcuted plot ---
-"""
-x,y,z = filter_rae(prediction, 6)
-ax1 = fig.add_subplot(122, projection='3d')  # 1 row, 3 columns, first plot
-ax1.scatter(x, y, z, c='blue', s=1)
-ax1.set_title('Predicted Scan')
-ax1.set_xlabel('X')
-ax1.set_ylabel('Y')
-ax1.set_zlabel('Z')
-ax1.set_xlim(x_limits)
-ax1.set_ylim(y_limits)
-ax1.set_zlim(z_limits)
-"""
+# Prediction plot
 #x, y, z, cnr = filter_rae(prediction, 6)
 x, y, z, cnr = filter_base(prediction)
 
@@ -164,12 +149,10 @@ ax1.set_xlim(x_limits)
 ax1.set_ylim(y_limits)
 ax1.set_zlim(z_limits)
 
-# --- pc1 plot ---
-#x,y,z,cnr = filter_rae(recon_ground, 6)
+# Ground Truth plot
+# x,y,z,cnr = filter_rae(recon_ground, 6)
 x, y, z, cnr = filter_base(recon_ground)
 ax1 = fig.add_subplot(132, projection='3d')  # 1 row, 3 columns, first plot
-#ax1.scatter(x, y, z, c='blue', s=1)
-
 
 # Assign color by bin
 cnr_bins = np.digitize(cnr, bins) - 1
@@ -187,11 +170,10 @@ ax1.set_ylim(y_limits)
 ax1.set_zlim(z_limits)
 
 
-# --- pc2 plot ---
+# Previous Plot
 #x,y,z,cnr = filter_rae(previous, 6)
 x, y, z, cnr = filter_base(previous)
 ax1 = fig.add_subplot(131, projection='3d')  # 1 row, 3 columns, first plot
-#ax1.scatter(x, y, z, c='blue', s=1)
 
 # Assign color by bin
 cnr_bins = np.digitize(cnr, bins) - 1

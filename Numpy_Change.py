@@ -7,8 +7,8 @@ def convert_cartesian_to_polar(pc_data_final):
     Convert existing processed data from Cartesian to polar coordinates
     
     Input shape: [N_points, 8]
-    - coords: [x,y,z] (normalized by 14500)
-    - feats: [cnr, wind_x, wind_y, wind_z] (winds normalized by 10) 
+    - coords: [x,y,z]
+    - feats: [cnr, wind_x, wind_y, wind_z]
     - time: [timestamp]
     
     Output shape: [N_points, 7] 
@@ -23,18 +23,18 @@ def convert_cartesian_to_polar(pc_data_final):
     wind_x, wind_y, wind_z = pc_data_final[:, 4], pc_data_final[:, 5], pc_data_final[:, 6]
     timestamp = pc_data_final[:, 7]
     
-    # Convert coordinates to polar (unnormalize first, then convert)
-    x_actual = x * 14500  # Denormalize
+    # Convert coordinates to polar
+    x_actual = x * 14500
     y_actual = y * 14500
     z_actual = z * 14500
     
-    # Calculate polar coordinates (keep unnormalized)
+    # Calculate polar coordinates
     range_vals = np.sqrt(x_actual**2 + y_actual**2 + z_actual**2)
     azimuth = np.degrees(np.arctan2(y_actual, x_actual))  # In degrees [-180, 180]
     elevation = np.degrees(np.arcsin(z_actual / (range_vals + 1e-8)))  # In degrees [-90, 90]
     
-    # Convert wind components to polar (unnormalize first)
-    wind_x_actual = wind_x * 10  # Denormalize
+    # Convert wind components to polar
+    wind_x_actual = wind_x * 10
     wind_y_actual = wind_y * 10
     wind_z_actual = wind_z * 10
     
@@ -45,14 +45,12 @@ def convert_cartesian_to_polar(pc_data_final):
     wind_radial = wind_x_actual * cos_az + wind_y_actual * sin_az
     wind_tangential = -wind_x_actual * sin_az + wind_y_actual * cos_az
     
-    # Keep wind components unnormalized (in original m/s units)
-    
     # Combine into new format (all unnormalized, no wind confidence)
     polar_data = np.column_stack([
-        azimuth, range_vals, elevation,  # Polar coordinates (unnormalized)
-        cnr,  # CNR (already processed)
-        wind_radial, wind_tangential, wind_z_actual,  # Polar winds (unnormalized m/s)
-        timestamp  # Time (unchanged)
+        azimuth, range_vals, elevation,
+        cnr,
+        wind_radial, wind_tangential, wind_z_actual,
+        timestamp
     ])
     
     return polar_data
@@ -93,7 +91,7 @@ def convert_all_files(input_dir, output_dir, apply_cnr_constraint=True):
         # Convert to polar
         polar_data = convert_cartesian_to_polar(pc_data)
         
-        # Apply CNR constraint if requested
+        # Apply CNR constraint if needed
         if apply_cnr_constraint:
             polar_data = apply_cnr_range_constraint(polar_data)
         
@@ -110,7 +108,7 @@ if __name__ == "__main__":
     input_directory = os.path.join(lidar_dir, "diff_clouds")
     output_directory = os.path.join(lidar_dir, "diff_clouds_polar")
     
-    #convert_all_files(input_directory, output_directory, apply_cnr_constraint=False)
+    convert_all_files(input_directory, output_directory, apply_cnr_constraint=False)
     
     print("Conversion complete! New data format (all unnormalized, no wind confidence):")
     print("- Column 0: Azimuth (degrees, -180 to 180)")
@@ -122,33 +120,3 @@ if __name__ == "__main__":
     print("- Column 6: Wind Vertical (m/s)")
     print("- Column 7: Timestamp")
     print("\nYou can normalize these later in your training code as needed!")
-    
-
-    # Load your full file (with azimuth, range, etc.)
-    pc = np.load("diff_clouds_polar/2025-07-28_10_40_polar.npy")
-    pc2 = np.load("diff_clouds_polar/2025-08-02_10_50_polar.npy")
-
-    print("Shape of data:", pc.shape)
-
-    # Assuming the columns are in the same order as in point_cloud_df:
-    # ['sweep_id','time(s)','timestamp','azimuth(deg)','radial_distance(m)',
-    #  'elevation(deg)','cnr','X(m)','Y(m)','Z(m)',
-    #  'wind_vel_X(m/s)','wind_vel_Y(m/s)','wind_vel_Z(m/s)','wind_vel_confidence(%)']
-
-    az = pc[:, 0]   # azimuth(deg)
-    rng = pc[:, 1]  # radial_distance(m)
-    elevation = pc[:,2]
-
-    pairs = np.column_stack((az, rng, elevation))
-
-    total = len(pairs)
-    unique = len(np.unique(pairs, axis=0))
-
-    print(f"Total pairs: {total}")
-    print(f"Unique pairs: {unique}")
-    print(f"Duplicates: {total - unique}")
-    
-    diff = pc2 - pc
-    
-    print(pc[1000:1010, 0:3])
-    print(pc2[1000:1010, 0:3])
