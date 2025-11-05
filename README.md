@@ -8,3 +8,5 @@ To use the training pipeline
 3. Run the LSTM.py script (Check directories listed and additional files are stored)
 4. To visuale output run LSTMSave.py
 5. For only validation set metrics then run LSTMEval.py
+
+For an overview of everything, use the attached Colab Notebook
